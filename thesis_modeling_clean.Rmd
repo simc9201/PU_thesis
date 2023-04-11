@@ -1,0 +1,607 @@
+---
+title: "thesis_modeling"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Load needed packages}
+library(magrittr)
+library(ggplot2)
+library(dplyr) 
+library(tidyverse)
+library(vip)
+library(caret)
+library(GGally)
+library(tidymodels)
+library(ranger)
+library(tinytex)
+library(fastDummies)
+library(coefplot)
+library(knitr)
+library(pROC)
+library(kableExtra)
+library(magick)
+library(vip)
+library(rpart.plot)
+```
+
+
+```{r load data into environment}
+#set working directory 
+setwd("~/Desktop/thesis stuff")
+#load("thesis_results_saved5.RData")
+
+data <- read.csv("edittedsubsetdata.csv")
+```
+
+```{r create target variable using old subset}
+#convert to factor from character variable 
+data$mode <- as.factor(data$mode)
+
+#rename target variable and convert to factor 
+data <- data %>% mutate(Class = hit_song) %>% select(-hit_song)
+data$Class <- as.factor(data$Class)
+
+#remove these variables from analysis
+data = subset(data, select = -c(X, danceability, energy, artist_country, song_hotttnesss) )
+```
+
+
+```{r testing and training sets}
+#testing and training sets 
+
+prop.table(table(data$Class)) #proportion of hit and non-hit songs 
+
+# split data into training and testing before subsampling
+set.seed(47202) #set seed for replication 
+data_split = initial_split(data, strata = 'Class', prop = 0.9) 
+train = training(data_split)
+test = testing(data_split)
+
+#check dim of test & non-test set (same proportion as original dataset)
+summary(train$Class) 
+summary(test$Class) 
+```
+
+```{r logistic reg baseline model}
+#referenced assignment 3 code from SML306 (Princeton undergrad course) 
+set.seed(4632057) #set seed to replicate results 
+
+#specify a simple logistic regression model
+logit_spec <- logistic_reg() %>% 
+  set_mode("classification") %>%
+  set_engine("glm") 
+
+#specify a recipe (preprocessing steps) 
+logit_rec <- recipe(Class ~ ., data = train) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_novel(all_nominal_predictors()) 
+
+#create a workflow object 
+logit_wf <- workflow() %>% 
+  add_recipe(logit_rec) %>% 
+  add_model(logit_spec)
+
+#train on training set 
+logit_fit <- fit(logit_wf, data = train)
+
+#generate predictions for testing set
+logit_pred <- augment(logit_fit, new_data = test) 
+
+#calculate accuracy from predictions and compare to true values
+logit_accuracy <- logit_pred %>% accuracy(truth = Class, estimate = .pred_class)
+logit_accuracy
+
+#calculate roc_auc from predictions 
+logit_auc <- roc_auc(logit_pred, truth = Class, .pred_Hit) 
+logit_auc
+
+#plot ROC curve
+logit_auc_curve = logit_pred %>%
+  roc_curve(truth = Class, .pred_Hit)
+autoplot(logit_auc_curve)
+
+#generate confusion matrix 
+confusionMatrix(logit_pred$Class, logit_pred$.pred_class)
+
+#TP, FP, FN, and TN values from confusion matrix 
+log_reg_TP = 64
+log_reg_FP = 77
+log_reg_FN = 22
+log_reg_TN = 402 
+
+
+#calculate precision score
+log_reg_precision <- log_reg_TP / (log_reg_TP + log_reg_FP)
+log_reg_precision
+
+#calculate recall score
+log_reg_recall <- log_reg_TP / (log_reg_TP + log_reg_FN) 
+log_reg_recall
+
+#calculate F1 
+log_reg_F1 <- 2*(log_reg_precision * log_reg_recall) / (log_reg_precision + log_reg_recall)
+log_reg_F1
+
+#save coefficient estimates in latex table format 
+print_coef_logit_exp <- tidy(logit_fit, exponentiate = TRUE) %>% select(-std.error, -statistic)
+print_coef_logit <- tidy(logit_fit) %>% select(-std.error, -statistic) %>% 
+  mutate(exp_estimate = print_coef_logit_exp$estimate) %>% 
+  relocate(exp_estimate, .before = p.value)
+print.xtable(xtable(print_coef_logit, digits = 5), 
+             file = "./LogitCoefficients.txt")
+```
+
+
+```{r LASSO model}
+set.seed(75920572) #set seed to replicate results 
+
+#create a k fold cross validation on training set 
+train_folds <- vfold_cv(train, v = 10)
+
+#specify a lasso regression and tune penalty parameter 
+lasso_tuned_spec <- logistic_reg(mixture = 1, penalty = tune()) %>% 
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+#specify a recipe (preprocessing steps) 
+lasso_tuned_rec <- recipe(Class ~ ., data = train) %>% 
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>% 
+  step_normalize(all_numeric_predictors())
+
+#create a workflow object 
+lasso_tuned_wf <- workflow() %>% 
+  add_recipe(lasso_tuned_rec) %>% 
+  add_model(lasso_tuned_spec)
+
+#create a grid of potential values for penalty parameter 
+penalty_grid <- grid_regular(penalty(range=c(-3, 3)), levels = 250)
+
+#tune grid with cross validation, specify AUC score as metric 
+tune_res <- tune_grid(
+  object = lasso_tuned_wf, 
+  resamples = train_folds, 
+  grid = penalty_grid,
+  metrics = metric_set(roc_auc)
+  )
+
+autoplot(tune_res) #results of tuning 
+
+#find best penalty term maximizing roc auc scores 
+best_penalty <- select_best(tune_res, metric = 'roc_auc')
+best_penalty
+
+#finalize workflow object with best penalty 
+lasso_final <- finalize_workflow(lasso_tuned_wf, best_penalty)
+
+#train on training set 
+lasso_final_fit <- fit(lasso_final, data = train)
+
+#generate predictions for testing set
+pred_lasso_final <- augment(lasso_final_fit, new_data = test) 
+
+#calculate accuracy from predictions
+lasso_accuracy <- pred_lasso_final %>% accuracy(truth = Class, estimate = .pred_class)
+lasso_accuracy
+
+#calculate roc_auc from predictions
+lasso_auc <- roc_auc(pred_lasso_final, truth = Class, .pred_Hit) 
+lasso_auc
+
+#plot ROC curve 
+lasso_auc_curve = pred_lasso_final %>% roc_curve(truth = Class, .pred_Hit)
+autoplot(lasso_auc_curve)
+
+#generate confusion matrix 
+confusionMatrix(pred_lasso_final$Class, pred_lasso_final$.pred_class)
+
+#TP, FP, FN, and TN values from confusion matrix 
+lasso_TP = 63
+lasso_FP = 78
+lasso_FN = 17
+lasso_TN = 407
+
+#calculate precision score
+lasso_precision <- lasso_TP / (lasso_TP + lasso_FP)
+lasso_precision
+
+#calculate recall score
+lasso_recall <- lasso_TP / (lasso_TP + lasso_FN) 
+lasso_recall
+
+#calculate F1 
+lasso_F1 <- 2*(lasso_precision * lasso_recall) / (lasso_precision + lasso_recall)
+lasso_F1
+
+#save coefficient estimates in latex table format 
+print_coef_lasso <- tidy(lasso_final_fit) %>% select(-penalty)
+print.xtable(xtable(print_coef_lasso, digits = 5), 
+             file = "./LASSOCoefficients.txt")
+
+#variable importance plot
+lasso_final_fit %>% 
+  extract_fit_parsnip() %>% 
+  vi(lambda = best_penalty$penalty) %>%
+    mutate(
+        Importance = abs(Importance),
+        Variable = fct_reorder(Variable, Importance)
+    ) %>% 
+  filter(Importance > 0) %>% 
+  ggplot(aes(x = Importance, y = Variable)) + 
+  geom_col(fill = "slateblue3", alpha = 0.7) + labs(y = NULL)
+```
+
+
+```{r elastic net model}
+set.seed(375927) #set seed to replicate results 
+
+#create a k fold cross validation on training set 
+elastic_train_folds <- vfold_cv(train, v = 10)
+
+#specify a lasso regression and tune penalty parameter 
+elastic_tuned_spec <- logistic_reg(mixture = tune(), penalty = tune()) %>% 
+  set_mode("classification") %>%
+  set_engine("glmnet") 
+
+#specify a recipe (preprocessing steps) 
+elastic_tuned_rec <- recipe(Class ~ ., data = train) %>% 
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>% 
+  step_normalize(all_numeric_predictors())
+
+#create a workflow object 
+elastic_tuned_wf <- workflow() %>% 
+  add_recipe(elastic_tuned_rec) %>% 
+  add_model(elastic_tuned_spec)
+
+#choose 50 grid points automatically and use parallel processing 
+doParallel::registerDoParallel()
+elastic_tune_res <- tune_grid(elastic_tuned_wf, 
+                              resamples = elastic_train_folds, 
+                              grid = 20)
+
+#results of tuning
+elastic_tune_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mixture, penalty) %>%
+  pivot_longer(mixture:penalty,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+
+#set ranges for hyperparameters
+set.seed(4629471) #set seed for replication
+elastic_penalty_grid <- grid_regular(
+  penalty(),
+  mixture(range = c(0.3, 0.88)),
+  levels = c(40, 20)
+) %>% filter(penalty < 0.1) %>% filter(1.778279e-04 <= penalty)
+#filtering under 0.2 returns same result as filtering under 0.1
+
+#tune again with parameters in specified ranges 
+elastic_retune_res <- tune_grid(
+  elastic_tuned_wf,
+  resamples = elastic_train_folds,
+  grid = elastic_penalty_grid
+)
+
+#results from tuning again
+elastic_retune_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  mutate(penalty = factor(round(penalty, 5))) %>%
+  ggplot(aes(mixture, mean, color = penalty)) +
+  geom_point() +
+  geom_line() +
+  labs(y = "AUC")
+
+#select best parameters based on auc scores 
+elastic_best_parameters = select_best(elastic_retune_res, "roc_auc")
+elastic_best_parameters
+
+#finalize model with best parameters found 
+elastic_final <- finalize_workflow(elastic_tuned_wf, elastic_best_parameters)
+
+#train on training set 
+elastic_final_fit <- fit(elastic_final, data = train)
+
+#generate predictions for testing set
+pred_elastic_final <- augment(elastic_final_fit, new_data = test) 
+
+#calculate accuracy from predictions
+elastic_accuracy <- pred_elastic_final %>% accuracy(truth = Class, estimate = .pred_class)
+elastic_accuracy
+
+#calculate roc_auc from predictions
+elastic_auc <- roc_auc(pred_elastic_final, truth = Class, .pred_Hit)
+elastic_auc
+
+#plot ROC curve 
+elastic_auc_curve = pred_elastic_final %>% roc_curve(truth = Class, .pred_Hit)
+autoplot(elastic_auc_curve)
+
+#generate confusion matrix
+confusionMatrix(pred_elastic_final$Class, pred_elastic_final$.pred_class)  
+
+#TP, FP, FN, and TN values from confusion matrix 
+elastic_TP = 61
+elastic_FP = 80
+elastic_FN = 17
+elastic_TN = 407
+
+#calculate precision score
+elastic_precision <- elastic_TP / (elastic_TP + elastic_FP)
+elastic_precision
+
+#calculate recall score
+elastic_recall <- elastic_TP / (elastic_TP + elastic_FN) 
+elastic_recall
+
+#calculate F1 
+elastic_F1 <- 2*(elastic_precision * elastic_recall) / (elastic_precision + elastic_recall)
+elastic_F1
+
+#save coefficient estimates in latex table format 
+print_coef_elastic <- tidy(elastic_final_fit) %>% select(-penalty)
+print.xtable(xtable(print_coef_elastic, digits = 5), 
+             file = "./ElasticCoefficients.txt")
+
+#variable importance plot
+elastic_final_fit %>% 
+  extract_fit_parsnip() %>% 
+  vi(lambda = elastic_best_parameters$penalty) %>%
+    mutate(
+        Importance = abs(Importance),
+        Variable = fct_reorder(Variable, Importance)
+    ) %>% 
+  filter(Importance > 0) %>% 
+  ggplot(aes(x = Importance, y = Variable)) + 
+  geom_col(fill = "slateblue3", alpha = 0.7) + labs(y = NULL) 
+```
+
+
+```{r DT model}
+set.seed(738156295) #set seed to replicate results 
+
+#create a k fold cross validation on training set 
+dt_train_folds <- vfold_cv(train, v = 10)
+
+#specify a decision tree model and tune all 3 parameters 
+dt_tuned_spec <- decision_tree(cost_complexity = tune(), 
+                               tree_depth = tune(), 
+                               min_n = tune()) %>% 
+  set_mode("classification") %>%
+  set_engine("rpart") 
+
+#specify a recipe (preprocessing steps) 
+dt_tuned_rec <- recipe(Class ~ ., data = train) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors())
+
+#create a workflow object 
+dt_tuned_wf <- workflow() %>% 
+  add_recipe(dt_tuned_rec) %>% 
+  add_model(dt_tuned_spec)
+
+#set of possible parameter values to try out for the decision tree
+dt_penalty_grid <- grid_regular(
+  cost_complexity(),
+  tree_depth(),
+  min_n(),
+  levels = 10 
+)
+
+#try out all the possible parameter values on all resampled datasets in CV
+doParallel::registerDoParallel() #use parallel processing 
+dt_tuned_res <- tune_grid(dt_tuned_wf, 
+                          resamples = dt_train_folds, 
+                          grid = dt_penalty_grid, 
+                          metrics = metric_set(roc_auc))
+
+#results of tuning parameters
+#autoplot(dt_tuned_res)
+dt_tuned_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  filter(mean > 0.6) %>%
+  select(mean, cost_complexity, tree_depth, min_n) %>%
+  pivot_longer(cost_complexity:min_n,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+
+#set ranges for hyperparameters
+set.seed(572057263)
+dt_penalty_grid <- grid_regular(
+  cost_complexity(),
+  min_n(range = c(1, 10)),
+  tree_depth(range = c(4, 7)),
+  levels = 10
+)
+
+#tune again with parameters in specified ranges 
+dt_retune_res <- tune_grid(
+  dt_tuned_wf,
+  resamples = dt_train_folds,
+  grid = dt_penalty_grid, 
+  metrics = metric_set(roc_auc)
+)
+
+#results from tuning again
+autoplot(dt_retune_res)
+
+#select best parameters based on auc scores  
+dt_best_parameters = select_best(dt_retune_res, "roc_auc")
+dt_best_parameters
+
+#finalize model with best parameters found 
+dt_final <- finalize_workflow(dt_tuned_wf, dt_best_parameters)
+
+#train on training set 
+dt_final_fit <- fit(dt_final, data = train)
+
+#generate predictions for testing set
+pred_dt_final <- augment(dt_final_fit, new_data = test) 
+
+#calculate accuracy from predictions
+dt_accuracy <- pred_dt_final %>% accuracy(truth = Class, estimate = .pred_class)
+dt_accuracy
+#using levels = 10 results in accuracy of 0.835
+
+#calculate roc_auc from predictions
+dt_auc <- roc_auc(pred_dt_final, truth = Class, .pred_Hit)
+dt_auc
+#using levels = 7 results in auc of 0.864
+
+#plot ROC curve 
+dt_auc_curve = pred_dt_final %>% roc_curve(truth = Class, .pred_Hit)
+autoplot(dt_auc_curve)
+
+#generate confusion matrix 
+confusionMatrix(pred_dt_final$Class, pred_dt_final$.pred_class)
+
+#TP, FP, FN, and TN values from confusion matrix 
+dt_TP = 75
+dt_FP = 66
+dt_FN = 27
+dt_TN = 397
+
+#calculate precision score 
+dt_precision <- dt_TP / (dt_TP + dt_FP)
+dt_precision
+
+#calculate recall score 
+dt_recall <- dt_TP / (dt_TP + dt_FN) 
+dt_recall
+
+#calculate F1 
+dt_F1 <- 2*(dt_precision * dt_recall) / (dt_precision + dt_recall)
+dt_F1
+
+#variable importance plot 
+var_imp_plot <- dt_final_fit %>%
+  extract_fit_parsnip() %>%
+  vip(geom = 'col', aesthetics = list(fill = "slateblue3", alpha = 0.7)) 
+var_imp_plot
+
+#tree visualization 
+dt_final = dt_final_fit %>% extract_fit_parsnip()
+rpart.plot(dt_final$fit, roundint=FALSE, extra = 8) #roundint=FALSE mutes warning message
+```
+
+
+```{r RF model}
+set.seed(639571593) #set seed to replicate results 
+
+#create a k fold cross validation on training set 
+rf_train_folds <- vfold_cv(train, v = 10)
+
+#cores in computer 
+cores = parallel::detectCores()
+
+#specify a decision tree model and tune 2 parameters with 5000 trees specified  
+rf_tuned_spec <- rand_forest(mtry = tune(), 
+                             min_n = tune(), 
+                             trees = 5000) %>% 
+  set_mode("classification") %>%
+  set_engine("ranger", importance="impurity", num.threads = cores) 
+
+#specify a recipe (preprocessing steps) 
+rf_tuned_rec <- recipe(Class ~ ., data = train) %>%
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors())
+
+#create a workflow object 
+rf_tuned_wf <- workflow() %>% 
+  add_recipe(rf_tuned_rec) %>% 
+  add_model(rf_tuned_spec)
+
+#tune 10 values for both parameters needing tuning 
+set.seed(47294)
+doParallel::registerDoParallel() #parallel processing 
+rf_tune <-
+  tune_grid(rf_tuned_wf,
+    resamples = rf_train_folds,
+    grid = 10, 
+    metrics = metric_set(roc_auc)
+  )
+
+#results of tuning
+#autoplot(rf_tune)
+rf_tune %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry, min_n) %>%
+  pivot_longer(mtry:min_n,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+
+#find best parameter values using roc_auc 
+rf_best_parameters = select_best(rf_tune, "roc_auc")
+
+#finalize model with best parameter values found 
+final_rf <- rf_tuned_wf %>%
+  finalize_workflow(rf_best_parameters)
+
+#train on training set 
+rf_final_fit <- fit(final_rf, data = train)
+
+#generate predictions for testing set
+pred_rf_final <- augment(rf_final_fit, new_data = test)
+
+#calculate accuracy from predictions
+rf_accuracy <- pred_rf_final %>% accuracy(truth = Class, estimate = .pred_class)
+rf_accuracy
+
+#calculate roc_auc from predictions
+rf_auc <- roc_auc(pred_rf_final, truth = Class, .pred_Hit)
+rf_auc
+
+#plot ROC curve 
+rf_auc_curve = pred_rf_final %>% roc_curve(truth = Class, .pred_Hit)
+autoplot(rf_auc_curve)
+
+#generate confusion matrix 
+confusionMatrix(pred_rf_final$Class, pred_rf_final$.pred_class)
+
+#TP, FP, FN, and TN values from confusion matrix 
+rf_TP = 67
+rf_FP = 74
+rf_FN = 31
+rf_TN = 393
+
+#calculate precision score 
+rf_precision <- rf_TP / (rf_TP + rf_FP)
+rf_precision
+
+#calculate recall score 
+rf_recall <- rf_TP / (rf_TP + rf_FN) 
+rf_recall
+
+#calculate F1 
+rf_F1 <- 2*(rf_precision * rf_recall) / (rf_precision + rf_recall)
+rf_F1
+
+#variable importance plot
+rf_final_fit %>%
+  extract_fit_parsnip() %>%
+  vip(geom = 'col', aesthetics = list(fill = "slateblue3", alpha = 0.7)) 
+```
+
+
